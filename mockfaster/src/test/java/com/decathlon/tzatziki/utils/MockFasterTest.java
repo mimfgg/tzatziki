@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import org.mockserver.model.JsonBody;
 
 import java.util.List;
+import java.util.stream.IntStream;
 
 import static com.decathlon.tzatziki.utils.Matchers.equalsInOrder;
 import static io.restassured.RestAssured.when;
@@ -86,11 +87,8 @@ class MockFasterTest {
 
     @Test
     @Disabled // to run manually on mac
-    void manyCalls() {
-        for (int i = 0; i < 1000; i++) {
-            if (i % 100 == 0) {
-                System.out.printf("created %d mocks%n", i);
-            }
+    void manyMocksInParallel() {
+        IntStream.range(0, 1000).parallel().forEach(i -> {
             MockFaster.when(request().withMethod("GET").withPath("/test/" + i), Comparison.CONTAINS)
                     .respond(response()
                             .withContentType(APPLICATION_JSON)
@@ -101,6 +99,6 @@ class MockFasterTest {
                     .assertThat()
                     .body(equalsInOrder("message: wabadabadaboo"));
             MockFaster.reset();
-        }
+        });
     }
 }

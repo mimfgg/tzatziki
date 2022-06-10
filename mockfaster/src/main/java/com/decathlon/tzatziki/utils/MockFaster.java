@@ -8,7 +8,6 @@ import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
-import org.apache.commons.lang3.concurrent.ConcurrentException;
 import org.apache.commons.lang3.concurrent.ConcurrentInitializer;
 import org.apache.commons.lang3.concurrent.LazyInitializer;
 import org.apache.commons.lang3.tuple.Pair;
@@ -52,44 +51,48 @@ public class MockFaster {
     private static final String PROTOCOL = "(?:([^:]+)://)?";
     private static final String HOST = "([^/]+)?";
     private static final Pattern URI = Pattern.compile("^" + PROTOCOL + HOST + "((/[^?]+)?(?:\\?(.+))?)?$");
-    private static final ClientAndServer CLIENT_AND_SERVER = new ClientAndServer();
-    private static final ConcurrentInitializer<Integer> LOCAL_PORT = new LazyInitializer<>() {
-        @Override
-        protected Integer initialize() {
-            return CLIENT_AND_SERVER.getLocalPort();
-        }
-    };
-    private static final Map<String, Pair<Expectation[], UpdatableExpectationResponseCallback>> MOCKS = new LinkedHashMap<>();
-    private static final ConcurrentInitializer<HttpState> HTTP_STATE = new LazyInitializer<>() {
+    private static final ThreadLocal<Instance> instance = ThreadLocal.withInitial(Instance::new);
 
-        @Override
-        protected HttpState initialize() throws ConcurrentException {
-            org.mockserver.netty.MockServer mockserver = getValue(CLIENT_AND_SERVER, "mockServer");
-            ServerBootstrap serverServerBootstrap = getValue(mockserver, "serverServerBootstrap");
-            MockServerUnificationInitializer childHandler = getValue(serverServerBootstrap, "childHandler");
-            System.setProperty("mockserver.webSocketClientEventLoopThreadCount", "1");
-            return getValue(childHandler, "httpState");
-        }
-    };
-    private static final Set<String> MOCKED_PATHS = new LinkedHashSet<>();
-    private static int latestPriority = 0;
+    private static class Instance {
+        private final ClientAndServer clientAndServer = new ClientAndServer();
+        private final ConcurrentInitializer<Integer> localPort = new LazyInitializer<>() {
+            @Override
+            protected Integer initialize() {
+                return clientAndServer.getLocalPort();
+            }
+        };
+        private final Map<String, Pair<Expectation[], UpdatableExpectationResponseCallback>> mocks = new LinkedHashMap<>();
+        private final ConcurrentInitializer<HttpState> httpState = new LazyInitializer<>() {
+
+            @Override
+            protected HttpState initialize() {
+                org.mockserver.netty.MockServer mockserver = getValue(clientAndServer, "mockServer");
+                ServerBootstrap serverServerBootstrap = getValue(mockserver, "serverServerBootstrap");
+                MockServerUnificationInitializer childHandler = getValue(serverServerBootstrap, "childHandler");
+                System.setProperty("mockserver.webSocketClientEventLoopThreadCount", "1");
+                return getValue(childHandler, "httpState");
+            }
+        };
+        private final Set<String> mockedPaths = new LinkedHashSet<>();
+        private int latestPriority = 0;
+    }
 
     public static synchronized void add_mock(HttpRequest httpRequest, ExpectationResponseCallback callback, Comparison comparison) {
-        HttpState httpState = unchecked(HTTP_STATE::get);
+        HttpState httpState = unchecked(instance.get().httpState::get);
         CircularPriorityQueue<String, HttpRequestMatcher, SortableExpectationId> expectationsQueue = Fields.getValue(httpState.getRequestMatchers(), "httpRequestMatchers");
         httpState.getRequestMatchers().retrieveActiveExpectations(httpRequest)
                 // we are redefining an old mock with a matches, let's see if we have old callbacks still in 404
                 .stream()
                 .filter(expectation -> {
-                    Pair<Expectation[], UpdatableExpectationResponseCallback> updatableExpectationResponseCallbackPair = MOCKS.get(expectation.getHttpRequest().toString());
+                    Pair<Expectation[], UpdatableExpectationResponseCallback> updatableExpectationResponseCallbackPair = instance.get().mocks.get(expectation.getHttpRequest().toString());
                     if (updatableExpectationResponseCallbackPair == null) {
                         log.error("""
                                 couldn't find the httpRequest in the mocks, this shouldn't happen!
                                                         
                                 httpRequest: {}
                                                         
-                                MOCKS keys: {}
-                                """, toYaml(httpRequest.toString()), toYaml(MOCKS.keySet()));
+                                mocks keys: {}
+                                """, toYaml(httpRequest.toString()), toYaml(instance.get().mocks.keySet()));
                         return false;
                     }
                     return updatableExpectationResponseCallbackPair.getValue().callback.equals(NOT_FOUND);
@@ -97,16 +100,16 @@ public class MockFaster {
                 .forEach(expectation -> {
                     expectationsQueue.remove(expectationsQueue.getByKey(expectation.getId()).orElseThrow(() ->
                             new IllegalStateException("couldn't find the old expectation in the queue for removal")));
-                    MOCKS.remove(expectation.getHttpRequest().toString());
+                    instance.get().mocks.remove(expectation.getHttpRequest().toString());
                     log.debug("removing expectation {}", expectation.getHttpRequest());
                 });
 
         AtomicBoolean isNew = new AtomicBoolean(false);
-        latestPriority++;
-        final Pair<Expectation[], UpdatableExpectationResponseCallback> expectationWithCallback = MOCKS.computeIfAbsent(httpRequest.toString(), k -> {
+        instance.get().latestPriority++;
+        final Pair<Expectation[], UpdatableExpectationResponseCallback> expectationWithCallback = instance.get().mocks.computeIfAbsent(httpRequest.toString(), k -> {
             isNew.set(true);
             UpdatableExpectationResponseCallback updatableCallback = new UpdatableExpectationResponseCallback();
-            Expectation[] expectations = CLIENT_AND_SERVER.when(httpRequest, Times.unlimited(), TimeToLive.unlimited(), latestPriority).respond(updatableCallback);
+            Expectation[] expectations = instance.get().clientAndServer.when(httpRequest, Times.unlimited(), TimeToLive.unlimited(), instance.get().latestPriority).respond(updatableCallback);
 
             modifyJsonStrictnessMatcher(
                     Arrays.stream(expectations)
@@ -124,7 +127,7 @@ public class MockFaster {
         if (!isNew.get()) {
             Arrays.stream(expectationWithCallback.getKey())
                     // update the priority of the expectation
-                    .map(expectation -> expectation.withPriority(latestPriority))
+                    .map(expectation -> expectation.withPriority(instance.get().latestPriority))
                     // re-add the expectations, this will resort the CircularPriorityQueue
                     .forEach(expectation -> httpState.getRequestMatchers().add(expectation, MockServerMatcherNotifier.Cause.API));
         }
@@ -160,7 +163,7 @@ public class MockFaster {
     public static String mocked(String path) {
         Matcher uri = match(path);
         if (uri.group(2) != null) {
-            MOCKED_PATHS.add(uri.group(1) + "://" + uri.group(2));
+            instance.get().mockedPaths.add(uri.group(1) + "://" + uri.group(2));
             return remapAsMocked(uri);
         }
         return path;
@@ -168,7 +171,7 @@ public class MockFaster {
 
     public static String target(String path) {
         Matcher uri = match(path);
-        if (uri.group(2) != null && MOCKED_PATHS.contains(uri.group(1) + "://" + uri.group(2))) {
+        if (uri.group(2) != null && instance.get().mockedPaths.contains(uri.group(1) + "://" + uri.group(2))) {
             return url() + remapAsMocked(uri);
         }
         return path;
@@ -180,7 +183,7 @@ public class MockFaster {
     }
 
     public static Integer localPort() {
-        return unchecked(LOCAL_PORT::get);
+        return unchecked(instance.get().localPort::get);
     }
 
     private static final Set<Pattern> PATH_PATTERNS = new LinkedHashSet<>();
@@ -198,7 +201,7 @@ public class MockFaster {
                 });
         List<LogEventRequestAndResponse> requestResponses = new ArrayList<>();
         CompletableFuture<Void> waiter = new CompletableFuture<>();
-        unchecked(HTTP_STATE::get).getMockServerLog().retrieveRequestResponses(httpRequest, logEventRequestAndResponses -> {
+        unchecked(instance.get().httpState::get).getMockServerLog().retrieveRequestResponses(httpRequest, logEventRequestAndResponses -> {
             requestResponses.addAll(logEventRequestAndResponses);
             waiter.complete(null);
         });
@@ -331,26 +334,28 @@ public class MockFaster {
     }
 
     public static ClientAndServer clientAndServer() {
-        return CLIENT_AND_SERVER;
+        return instance.get().clientAndServer;
     }
 
     public static void reset() {
         OperatingSystemMXBean os = ManagementFactory.getOperatingSystemMXBean();
-        if(os instanceof UnixOperatingSystemMXBean unixOs && (unixOs.getMaxFileDescriptorCount() - unixOs.getOpenFileDescriptorCount() < Long.parseLong(System.getProperty("mockfaster.fd.threshold", "300")))){
-            System.err.println("resetting mockserver instance not to exceed the max amount of mocks");
-            CLIENT_AND_SERVER.reset();
-            MOCKS.clear();
+        if (os instanceof UnixOperatingSystemMXBean unixOs
+                && (unixOs.getOpenFileDescriptorCount() > Integer.parseInt(System.getProperty("mockfaster.fd.threshold", String.valueOf((int) (unixOs.getMaxFileDescriptorCount() * .75)))))) {
+            System.err.printf("resetting mockserver instance not to run out of file descriptors in %s (max %s current %s)%n",
+                    Thread.currentThread(), unixOs.getMaxFileDescriptorCount(), unixOs.getOpenFileDescriptorCount());
+            instance.get().clientAndServer.reset();
+            instance.get().mocks.clear();
         } else {
-            MOCKS.values().forEach(expectationIdsWithUpdatableCallback -> expectationIdsWithUpdatableCallback.getValue().set(NOT_FOUND));
-            unchecked(HTTP_STATE::get).getMockServerLog().reset();
+            instance.get().mocks.values().forEach(expectationIdsWithUpdatableCallback -> expectationIdsWithUpdatableCallback.getValue().set(NOT_FOUND));
+            unchecked(instance.get().httpState::get).getMockServerLog().reset();
         }
-        MOCKED_PATHS.clear();
+        instance.get().mockedPaths.clear();
         PATH_PATTERNS.clear();
     }
 
     public static void stop() {
         reset();
-        CLIENT_AND_SERVER.stop();
+        instance.get().clientAndServer.stop();
     }
 
     private static class UpdatableExpectationResponseCallback implements ExpectationResponseCallback {
